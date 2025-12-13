@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual Environment
+venv/
+env/
+.env
+
+# Logs
+app_log.txt
+*.log
+
+# Build / Dist
+build/
+dist/
+*.spec
+
+# VS Code
+.vscode/
+
+# Project specific
+downloads/
+debug_yt.py
