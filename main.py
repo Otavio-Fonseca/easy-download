@@ -214,6 +214,11 @@ def main(page: ft.Page):
     page.bgcolor = BG_COLOR
     page.scroll = ft.ScrollMode.AUTO 
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER 
+    
+    # Icon Setup
+    icon_path = os.path.join(os.path.dirname(__file__), "assets", "icon.png")
+    if os.path.exists(icon_path):
+        page.window_icon = icon_path
 
     page.theme = ft.Theme(
         color_scheme_seed=PRIMARY_COLOR,
