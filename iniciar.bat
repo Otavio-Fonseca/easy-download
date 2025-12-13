@@ -1,9 +1,8 @@
 @echo off
-echo Iniciando Video Downloader...
-echo Logs serao salvos em app_log.txt
+if "%1" == "h" goto begin
+mshta vbscript:createobject("wscript.shell").run("""%~nx0"" h",0)(window.close)&&exit
+:begin
+cd /d "%~dp0"
 python setup_ffmpeg.py
 python create_shortcut.py
 python main.py
-echo.
-echo O programa encerrou.
-pause

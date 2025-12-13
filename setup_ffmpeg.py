@@ -9,6 +9,10 @@ FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_EXE = "ffmpeg.exe"
 FFPROBE_EXE = "ffprobe.exe"
 
+def show_message(msg):
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(0, msg, "Configuração Inicial", 0)
+
 def log(msg):
     print(f"[Auto-Setup] {msg}")
 
@@ -35,6 +39,10 @@ def setup():
         return
 
     log("FFmpeg not found. Starting auto-setup...")
+    # Notify user since console is hidden
+    import threading
+    threading.Thread(target=show_message, args=("O FFmpeg está sendo configurado pela primeira vez.\nIsso pode levar alguns instantes. O programa abrirá em breve.",)).start()
+
     zip_name = "ffmpeg_temp.zip"
     
     try:
