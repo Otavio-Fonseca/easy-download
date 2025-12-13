@@ -22,3 +22,5 @@ dist/
 # Project specific
 downloads/
 debug_yt.py
+ffmpeg.exe
+ffprobe.exe

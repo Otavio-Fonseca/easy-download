@@ -15,7 +15,7 @@ Uma aplicação desktop moderna e minimalista para baixar vídeos e áudios do Y
 ## 🛠️ Pré-requisitos
 
 - [Python 3.8+](https://www.python.org/downloads/) instalado.
-- [FFmpeg](https://ffmpeg.org/download.html) (Necessário para juntar áudio e vídeo em alta qualidade e para conversões de áudio). Certifique-se de adicioná-lo ao PATH do sistema.
+- **FFmpeg**: Configuração automática! O sistema baixará o FFmpeg na primeira execução se necessário.
 
 ## 📦 Instalação
 
