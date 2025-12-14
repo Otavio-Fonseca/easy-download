@@ -2,7 +2,7 @@
 
 Uma aplicação desktop moderna e minimalista para baixar vídeos e áudios do YouTube e outras plataformas com facilidade. Desenvolvido com Python e Flet.
 
-![Screenshot](https://via.placeholder.com/800x450.png?text=Easy+Download+Preview)
+![Screenshot](assets/preview.png)
 
 ## ✨ Funcionalidades
 

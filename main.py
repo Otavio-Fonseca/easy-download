@@ -7,6 +7,7 @@ import time
 import sys
 import logging
 import traceback
+import asyncio
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -54,15 +55,16 @@ class YtDlpService:
                 log_error(f"Error killing process: {e}")
 
     def get_info(self, url):
-        """Fetches metadata using subprocess."""
+        """Fetches metadata using subprocess. Supports single videos and playlists."""
         log(f"Fetching info for: {url}")
         
-        # Build command: python -m yt_dlp -J --no-playlist --socket-timeout 10 [url]
+        # Build command: python -m yt_dlp -J --flat-playlist --socket-timeout 15 [url]
+        # --flat-playlist: Get playlist metadata without full video info (faster)
         cmd = [
             sys.executable, "-m", "yt_dlp",
             "-J",
-            "--no-playlist",
-            "--socket-timeout", "15",
+            "--flat-playlist",
+            "--socket-timeout", "30",
             "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
             "--source-address", "0.0.0.0", # Force IPv4
             url
@@ -78,15 +80,21 @@ class YtDlpService:
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
             )
             
-            stdout, stderr = process.communicate(timeout=45) # Hard timeout for the process
+            stdout, stderr = process.communicate(timeout=90) # Hard timeout for the process
             
             if process.returncode != 0:
                 log_error(f"yt-dlp failed with code {process.returncode}")
+                # Common error: not a valid URL or private video
                 log_error(f"Stderr: {stderr}")
                 return None
             
             info = json.loads(stdout)
-            log(f"Info extracted: {info.get('title', 'Unknown')}")
+            
+            # Basic validation
+            if 'title' not in info and 'id' not in info and '_type' not in info:
+                 log(f"Warning: Unexpected info format: {info.keys()}")
+
+            log(f"Info extracted: {info.get('title', 'Unknown')} | Type: {info.get('_type', 'video')}")
             return info
 
         except subprocess.TimeoutExpired:
@@ -323,20 +331,20 @@ def main(page: ft.Page):
         content_container.controls.append(ft.Container(content=loading, alignment=ft.alignment.center, padding=50))
         page.update()
 
-        info = None
-        def fetch():
-            nonlocal info
-            info = service.get_info(url)
-        
-        t = threading.Thread(target=fetch)
-        t.start()
-        
-        start_time = time.time()
-        while t.is_alive():
-            if time.time() - start_time > 45: # Extended timeout for subprocess
-                log_error("UI Timeout on analysis.")
-                break
-            await __import__("asyncio").sleep(0.1)
+        # Run fetch in executor to avoid blocking and allow clean async wait
+        loop = asyncio.get_running_loop()
+        try:
+            # Use wait_for to enforce UI side timeout as well
+            info = await asyncio.wait_for(
+                loop.run_in_executor(None, service.get_info, url),
+                timeout=100.0
+            )
+        except asyncio.TimeoutError:
+             log_error("UI Timeout on analysis.")
+             info = None
+        except Exception as e:
+             log_error(f"Analysis Failed: {e}")
+             info = None
             
         if not info:
             content_container.controls.clear()
@@ -353,7 +361,10 @@ def main(page: ft.Page):
             page.update()
             return
 
-        show_options(info)
+        if info.get('_type') == 'playlist' or ('entries' in info and len(info.get('entries', [])) > 0):
+             show_playlist_options(info)
+        else:
+             show_options(info)
     
     analyze_btn.on_click = analyze_action
 
@@ -591,6 +602,320 @@ def main(page: ft.Page):
         t = threading.Thread(target=do_download)
         t.start()
         # No loop wait here, just fire and forget, UI updates via callback
+
+    # --- Playlist UI Support ---
+
+    class PlaylistEntry:
+        def __init__(self, entry_data, index):
+            self.data = entry_data
+            self.index = index
+            self.ref_quality = ft.Ref[ft.Dropdown]()
+            self.ref_format = ft.Ref[ft.Dropdown]()
+            self.ref_type_icon = ft.Ref[ft.Icon]()
+            self.ref_status = ft.Ref[ft.Text]()
+            self.is_audio = False # Default to video logic initially
+            
+            # Setup initial values
+            self.quality_val = "high"
+            self.format_val = "mp4"
+
+        def get_control(self):
+            title = self.data.get('title', 'Unknown')
+            duration = self.data.get('duration_string', 'N/A')
+            if not duration and self.data.get('duration'):
+                 # Simple conversion if needed, but flat-playlist usually gives duration
+                 import datetime
+                 duration = str(datetime.timedelta(seconds=int(self.data['duration'])))
+            
+            return ft.Container(
+                content=ft.Row([
+                    ft.Text(f"{self.index}.", weight=ft.FontWeight.BOLD, color=ft.Colors.GREY_500, width=30),
+                    ft.Icon(ft.Icons.VIDEO_FILE, color=PRIMARY_COLOR),
+                    ft.Column([
+                        ft.Text(title, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, width=350),
+                        ft.Text(f"Duração: {duration}", size=12, color=ft.Colors.GREY_500)
+                    ], spacing=2),
+                    ft.VerticalDivider(width=10, color=ft.Colors.TRANSPARENT),
+                    # Individual Controls
+                    ft.Dropdown(
+                        ref=self.ref_quality,
+                        width=120,
+                        # height property removed as it causes TypeError
+                        content_padding=10,
+                        text_size=12,
+                        value="high",
+                        options=[
+                            ft.dropdown.Option("high", "Alta"),
+                            ft.dropdown.Option("medium", "Média"),
+                            ft.dropdown.Option("low", "Baixa"),
+                        ],
+                        on_change=self.update_state
+                    ),
+                    ft.Dropdown(
+                        ref=self.ref_format,
+                        width=100,
+                        # height property removed
+                        content_padding=10,
+                        text_size=12,
+                        value="mp4",
+                        options=[
+                            ft.dropdown.Option("mp4", "MP4"),
+                            ft.dropdown.Option("mp3", "MP3"),
+                            # More added dynamically based on global toggle if needed, or static standard
+                        ],
+                        on_change=self.update_state
+                    ),
+                    ft.Container(width=10),
+                    ft.Text("", ref=self.ref_status, size=12, color=ft.Colors.GREY_600, width=80, text_align=ft.TextAlign.RIGHT)
+                ], alignment=ft.MainAxisAlignment.START),
+                padding=10,
+                border=ft.border.all(1, ft.Colors.GREY_200),
+                border_radius=8,
+                bgcolor=SURFACE_COLOR
+            )
+
+        def update_state(self, e):
+            self.quality_val = self.ref_quality.current.value
+            self.format_val = self.ref_format.current.value
+
+        def sync_global(self, is_audio, quality, fmt):
+            self.is_audio = is_audio
+            # Update values
+            self.ref_quality.current.value = quality
+            self.quality_val = quality
+            
+            # Update options for format if switching type
+            if is_audio:
+                 self.ref_format.current.options = [
+                     ft.dropdown.Option("mp3", "MP3"),
+                     ft.dropdown.Option("m4a", "M4A"),
+                     ft.dropdown.Option("wav", "WAV")
+                 ]
+            else:
+                 self.ref_format.current.options = [
+                     ft.dropdown.Option("mp4", "MP4"),
+                     ft.dropdown.Option("mkv", "MKV"),
+                     ft.dropdown.Option("webm", "WebM")
+                 ]
+            
+            # Check if current format is valid for new type, else reset
+            valid_opts = [o.key for o in self.ref_format.current.options]
+            if fmt in valid_opts:
+                self.ref_format.current.value = fmt
+                self.format_val = fmt
+            else:
+                self.ref_format.current.value = valid_opts[0]
+                self.format_val = valid_opts[0]
+
+            self.ref_quality.current.update()
+            self.ref_format.current.update()
+
+    def show_playlist_options(info):
+        content_container.controls.clear()
+        
+        entries = info.get('entries', [])
+        title = info.get('title', 'Playlist Desconhecida')
+        
+        # Refs for Global Controls
+        global_type_ref = ft.Ref[ft.Tabs]()
+        global_qual_ref = ft.Ref[ft.Dropdown]()
+        
+        playlist_entries = []
+        
+        # Header
+        header_card = ft.Container(
+            content=ft.Column([
+                ft.Text("PLAYLIST DETECTADA", size=12, weight=ft.FontWeight.BOLD, color=PRIMARY_COLOR),
+                ft.Text(title, size=20, weight=ft.FontWeight.W_800),
+                ft.Text(f"{len(entries)} Vídeos encontrados", color=ft.Colors.GREY_600)
+            ]),
+            padding=10
+        )
+
+        # Global Controls
+        def on_global_change(e):
+             # 0=Video, 1=Audio
+             is_audio = (global_type_ref.current.selected_index == 1)
+             qual = global_qual_ref.current.value
+             # Map global quality to format defaults or keep simple
+             fmt = "mp3" if is_audio else "mp4"
+             
+             for entry in playlist_entries:
+                 entry.sync_global(is_audio, qual, fmt)
+             page.update()
+
+        global_controls = ft.Card(
+            content=ft.Container(
+                content=ft.Column([
+                    ft.Text("Controle Universal", weight=ft.FontWeight.BOLD),
+                    ft.Tabs(
+                        ref=global_type_ref,
+                        selected_index=0,
+                        on_change=on_global_change,
+                        tabs=[ft.Tab(text="Vídeo"), ft.Tab(text="Áudio")]
+                    ),
+                    ft.Dropdown(
+                        ref=global_qual_ref,
+                        label="Qualidade Global",
+                        options=[
+                            ft.dropdown.Option("high", "Alta"),
+                            ft.dropdown.Option("medium", "Média"),
+                            ft.dropdown.Option("low", "Baixa"),
+                        ],
+                        value="high",
+                        on_change=on_global_change
+                    )
+                ], spacing=10),
+                padding=15
+            ),
+            color=SURFACE_COLOR,
+            elevation=2
+        )
+
+        # List
+        lv = ft.ListView(expand=False, height=350, spacing=10)
+        idx = 1
+        for entry in entries:
+             # Basic filter for valid entries
+             if entry.get('title') == '[Private video]': continue
+             pe = PlaylistEntry(entry, idx)
+             playlist_entries.append(pe)
+             lv.controls.append(pe.get_control())
+             idx += 1
+
+        # Path & Action
+        # Re-use path helpers from main scope (file_picker, path_text)
+        path_display = ft.Container(
+            content=ft.Row([
+                ft.Icon(ft.Icons.FOLDER_OPEN_ROUNDED, color=PRIMARY_COLOR),
+                ft.Text("Salvar em: ", color=ft.Colors.GREY_600),
+                ft.Text("Selecionar Pasta", ref=path_text, weight=ft.FontWeight.BOLD, width=400, overflow=ft.TextOverflow.ELLIPSIS)
+            ]),
+            padding=15,
+            border=ft.border.all(1, ft.Colors.GREY_300),
+            border_radius=BORDER_RADIUS,
+            on_click=lambda _: file_picker.get_directory_path(),
+            ink=True,
+            bgcolor=SURFACE_COLOR
+        )
+
+        btn_dl_all = ft.ElevatedButton(
+            "BAIXAR PLAYLIST COMPLETA",
+            icon=ft.Icons.PLAYLIST_ADD_CHECK_ROUNDED,
+            bgcolor=PRIMARY_COLOR,
+            color=ft.Colors.WHITE,
+            height=55,
+            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=30)),
+            on_click=lambda e: start_playlist_download(playlist_entries)
+        )
+
+        btn_cancel_playlist = ft.ElevatedButton(
+            "CANCELAR",
+            icon=ft.Icons.CLOSE_ROUNDED,
+            bgcolor=ft.Colors.RED_500,
+            color=ft.Colors.WHITE,
+            height=55,
+            visible=False,
+            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=30)),
+            on_click=lambda _: service.cancel()
+        )
+        
+        # Progress area for playlist
+        playlist_progress_col = ft.Column(visible=False, spacing=10)
+
+        content_container.controls.extend([
+             header_card,
+             global_controls,
+             ft.Container(content=lv, height=350, border=ft.border.all(1, ft.Colors.GREY_200), border_radius=8, padding=5),
+             path_display,
+             playlist_progress_col,
+             ft.Row([btn_dl_all, btn_cancel_playlist], alignment=ft.MainAxisAlignment.CENTER, spacing=10)
+        ])
+        page.update()
+
+        def start_playlist_download(entries_list):
+             if not path_text.current.value or path_text.current.value == "Nenhum local selecionado":
+                  page.show_snack_bar(ft.SnackBar(ft.Text("Selecione uma pasta de destino!")))
+                  return
+
+             btn_dl_all.visible = False
+             btn_cancel_playlist.visible = True
+             playlist_progress_col.visible = True
+             
+             # Create progress bars
+             overall_progress = ft.ProgressBar(width=600, color=PRIMARY_COLOR, bgcolor=ft.Colors.GREY_200)
+             overall_text = ft.Text("Iniciando...", color=ft.Colors.GREY_700, weight=ft.FontWeight.BOLD, size=16)
+             playlist_progress_col.controls = [overall_text, overall_progress]
+             page.update()
+             
+             def dl_thread():
+                 total = len(entries_list)
+                 completed = 0
+                 
+                 for i, item in enumerate(entries_list):
+                     if service._cancel_flag: break
+                     
+                     # UI Update for Item Start
+                     item.ref_status.current.value = "Baixando..."
+                     item.ref_status.current.color = ft.Colors.BLUE
+                     item.ref_status.current.update()
+                     
+                     # Check format: "75% ------------ 2/6"
+                     # Initial text before progress starts
+                     overall_text.value = f"0% ------------ {i+1}/{total}"
+                     page.update()
+
+                     # Download
+                     vid_url = item.data.get('url')
+                     if not vid_url and item.data.get('id'):
+                         vid_url = f"https://www.youtube.com/watch?v={item.data.get('id')}"
+                     
+                     def item_hook(d):
+                         if d.get('status') == 'downloading':
+                             p = d.get('_percent_str', '').replace('%','')
+                             if p:
+                                 # Update individual
+                                 item.ref_status.current.value = f"{p}%"
+                                 item.ref_status.current.update()
+                                 # Update Global: "75% ------------ 2/6"
+                                 overall_text.value = f"{p}% ------------ {i+1}/{total}"
+                                 overall_text.update()
+
+                     success, msg = service.download(
+                         vid_url, 
+                         path_text.current.value, 
+                         item.quality_val, 
+                         item.format_val, 
+                         item.is_audio, 
+                         item_hook
+                     )
+                     
+                     if success:
+                         item.ref_status.current.value = "Concluído"
+                         item.ref_status.current.color = ft.Colors.GREEN
+                     else:
+                         item.ref_status.current.value = "Erro"
+                         item.ref_status.current.color = ft.Colors.RED
+                         log_error(f"Failed item {i}: {msg}")
+                     
+                     item.ref_status.current.update()
+                     completed += 1
+                     overall_progress.value = completed / total
+                     page.update()
+
+                 if service._cancel_flag:
+                      overall_text.value = "Download Cancelado"
+                      overall_text.color = ft.Colors.RED
+                 else:
+                      overall_text.value = "Playlist Finalizada!"
+                      overall_text.color = ft.Colors.GREEN
+                 
+                 btn_dl_all.visible = True
+                 btn_cancel_playlist.visible = False
+                 page.update()
+
+             t = threading.Thread(target=dl_thread)
+             t.start()
 
     # --- Main Assembly ---
     page.add(
