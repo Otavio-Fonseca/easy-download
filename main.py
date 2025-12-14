@@ -133,14 +133,9 @@ class YtDlpService:
             cmd.extend(["-f", "bestaudio/best"])
             cmd.extend(["--extract-audio", "--audio-format", codec])
             
-            # Note: Quality arg for audio in CLI is --audio-quality, typically 0-9 (0 best) or bitrate.
-            # Map simplified quality to bitrate equivalent for ffmpeg if needed, 
-            # OR just use standard defaults. yt-dlp's --audio-quality is 5 by default.
-            # Creating complex post-processor args via CLI is tricky. 
-            # We will rely on default best conversion for stability.
-            if quality == 'low': cmd.extend(["--audio-quality", "128K"])
-            elif quality == 'high': cmd.extend(["--audio-quality", "320K"]) # ffmpeg usage
             # Simple fallback: let yt-dlp handle it.
+            if quality == 'low': cmd.extend(["--audio-quality", "128K"])
+            elif quality == 'high': cmd.extend(["--audio-quality", "320K"]) 
             
         else:
             # Video
@@ -152,6 +147,9 @@ class YtDlpService:
                 cmd.extend(["-f", f"bestvideo[height<=480]+bestaudio/best"])
             
             cmd.extend(["--merge-output-format", codec])
+
+        current_file = None # Track file for cleanup
+        tracked_files = set() # Track all potential temp files
 
         try:
             self._current_process = subprocess.Popen(
@@ -166,13 +164,44 @@ class YtDlpService:
 
             # Read stdout line by line
             for line in self._current_process.stdout:
-                if self._cancel_flag:
-                    self._current_process.terminate()
-                    return False, "Cancelado pelo usuário"
-                
                 line = line.strip()
                 if not line: continue
+
+                # Check cancel
+                if self._cancel_flag:
+                    self._current_process.terminate()
+                    # Wait briefly for termination
+                    try:
+                         self._current_process.wait(timeout=2)
+                    except: 
+                         self._current_process.kill()
+                    return False, "Cancelado pelo usuário"
                 
+                # Capture destination filenames (including intermediates for merges)
+                # [download] Destination: D:\...\file.f137.mp4
+                if line.startswith('[download] Destination:'):
+                    f = line.replace('[download] Destination:', '').strip()
+                    tracked_files.add(f)
+                    log(f"Tracking temp file: {f}")
+                
+                # [download] file.mp4 has already been downloaded
+                elif line.startswith('[download]') and 'has already been downloaded' in line:
+                    parts = line.split()
+                    if len(parts) > 1:
+                        f = parts[1]
+                        tracked_files.add(f)
+
+                # [Merger] Merging formats into "D:\...\file.mp4"
+                elif line.startswith('[Merger] Merging formats into'):
+                    # output is usually: [Merger] Merging formats into "filename"
+                    # We need to extract the filename from quotes
+                    try:
+                        f = line.split('"')[1]
+                        tracked_files.add(f)
+                        log(f"Tracking merge target: {f}")
+                    except:
+                        pass
+
                 # Simple progress parsing
                 # [download]  23.5% of ...
                 if line.startswith('[download]'):
@@ -185,11 +214,13 @@ class YtDlpService:
                              data['_total_bytes_str'] = parts[i+1]
                         if '/s' in part:
                              data['_speed_str'] = part
+                        if 'ETA' in parts and i < len(parts)-1 and parts[i] == 'ETA':
+                             data['_eta_str'] = parts[i+1]
                     progress_hook(data)
                 
                 # Check for post-processing
                 if '[ExtractAudio]' in line or '[Merger]' in line:
-                     progress_hook({'status': 'finished'})
+                     progress_hook({'status': 'processing'})
 
             self._current_process.wait()
             
@@ -206,6 +237,25 @@ class YtDlpService:
             return False, str(e)
         finally:
             self._current_process = None
+            # Cleanup on cancel
+            if self._cancel_flag:
+                 log(f"Cleanup initiated. Files to check: {tracked_files}")
+                 for fpath in tracked_files:
+                     try:
+                         # 1. Check exact path
+                         if os.path.exists(fpath):
+                             os.remove(fpath)
+                             log(f"Deleted: {fpath}")
+                         # 2. Check .part
+                         if os.path.exists(fpath + ".part"):
+                             os.remove(fpath + ".part")
+                             log(f"Deleted: {fpath}.part")
+                         # 3. Check .ytdl (sometimes used)
+                         if os.path.exists(fpath + ".ytdl"):
+                             os.remove(fpath + ".ytdl")
+                             log(f"Deleted: {fpath}.ytdl")
+                     except Exception as ex:
+                         log_error(f"Failed to cleanup {fpath}: {ex}")
 
 
 # --- UI (Flet) ---
@@ -380,6 +430,10 @@ def main(page: ft.Page):
     progress_bar = ft.Ref[ft.ProgressBar]()
     status_text = ft.Ref[ft.Text]()
     open_folder_btn = ft.Ref[ft.ElevatedButton]()
+    
+    # Global File Picker
+    file_picker = ft.FilePicker(on_result=lambda e: (path_text.current.__setattr__("value", e.path), path_text.current.update(), download_btn.current.__setattr__("disabled", False), download_btn.current.update()) if e.path else None)
+    page.overlay.append(file_picker)
 
     def show_options(info):
         content_container.controls.clear()
@@ -460,8 +514,8 @@ def main(page: ft.Page):
         )
 
         # 3. Path
-        file_picker = ft.FilePicker(on_result=lambda e: (path_text.current.__setattr__("value", e.path), path_text.current.update(), download_btn.current.__setattr__("disabled", False), download_btn.current.update()) if e.path else None)
-        page.overlay.append(file_picker)
+        # file_picker reused from main scope
+        # page.overlay.append(file_picker) # Already appended
 
         path_display = ft.Container(
             content=ft.Row([
@@ -605,6 +659,39 @@ def main(page: ft.Page):
 
     # --- Playlist UI Support ---
 
+    def format_seconds(seconds):
+        if not seconds: return "N/A"
+        try:
+            val = int(seconds)
+            m, s = divmod(val, 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h}:{m:02d}:{s:02d}"
+            return f"{m}:{s:02d}"
+        except:
+            return "N/A"
+
+    def estimate_size(duration_sec, is_audio, quality):
+        if not duration_sec: return 0
+        # Bitrate assumptions (approximate)
+        # Audio: High=320kbps, Med=192kbps, Low=128kbps
+        # Video: High(1080p)=4500kbps, Med(720p)=2500kbps, Low(480p)=1000kbps
+        # Size (MB) = (kbps * duration) / 8 / 1024
+        
+        rate = 0
+        if is_audio:
+            if quality == "high": rate = 320
+            elif quality == "medium": rate = 192
+            else: rate = 128
+        else:
+            # Video includes audio, so add ~128kbps
+            if quality == "high": rate = 4500 + 128
+            elif quality == "medium": rate = 2500 + 128
+            else: rate = 1000 + 128
+            
+        mb = (rate * duration_sec) / 8192 # 8 * 1024
+        return mb
+
     class PlaylistEntry:
         def __init__(self, entry_data, index):
             self.data = entry_data
@@ -621,16 +708,26 @@ def main(page: ft.Page):
 
         def get_control(self):
             title = self.data.get('title', 'Unknown')
-            duration = self.data.get('duration_string', 'N/A')
-            if not duration and self.data.get('duration'):
-                 # Simple conversion if needed, but flat-playlist usually gives duration
-                 import datetime
-                 duration = str(datetime.timedelta(seconds=int(self.data['duration'])))
+            duration = self.data.get('duration_string', '')
+            if not duration:
+                 sec = self.data.get('duration')
+                 duration = format_seconds(sec)
             
+            # Try to get thumbnail. --flat-playlist entries often have 'thumbnails' list or none.
+            thumb_src = ""
+            if self.data.get('thumbnails') and len(self.data['thumbnails']) > 0:
+                 # Get the first one (usually smallest) or last (largest). Let's try last for best quality.
+                 thumb_src = self.data['thumbnails'][-1].get('url', '')
+            
+            # Visual Content: Image or Icon
+            visual_content = ft.Icon(ft.Icons.VIDEO_FILE, color=PRIMARY_COLOR, size=40)
+            if thumb_src:
+                visual_content = ft.Image(src=thumb_src, width=80, height=45, fit=ft.ImageFit.COVER, border_radius=4)
+
             return ft.Container(
                 content=ft.Row([
                     ft.Text(f"{self.index}.", weight=ft.FontWeight.BOLD, color=ft.Colors.GREY_500, width=30),
-                    ft.Icon(ft.Icons.VIDEO_FILE, color=PRIMARY_COLOR),
+                    visual_content,
                     ft.Column([
                         ft.Text(title, weight=ft.FontWeight.W_600, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS, width=350),
                         ft.Text(f"Duração: {duration}", size=12, color=ft.Colors.GREY_500)
@@ -719,6 +816,7 @@ def main(page: ft.Page):
         # Refs for Global Controls
         global_type_ref = ft.Ref[ft.Tabs]()
         global_qual_ref = ft.Ref[ft.Dropdown]()
+        size_est_ref = ft.Ref[ft.Text]()
         
         playlist_entries = []
         
@@ -732,6 +830,18 @@ def main(page: ft.Page):
             padding=10
         )
 
+        def update_size_est():
+             is_audio = (global_type_ref.current.selected_index == 1)
+             qual = global_qual_ref.current.value
+             total_sec = 0
+             for e in entries:
+                 if e.get('duration'):
+                     total_sec += float(e['duration'])
+             
+             mb = estimate_size(total_sec, is_audio, qual)
+             size_est_ref.current.value = f"Estimado: ~{int(mb)} MB"
+             size_est_ref.current.update()
+
         # Global Controls
         def on_global_change(e):
              # 0=Video, 1=Audio
@@ -742,6 +852,8 @@ def main(page: ft.Page):
              
              for entry in playlist_entries:
                  entry.sync_global(is_audio, qual, fmt)
+             
+             update_size_est()
              page.update()
 
         global_controls = ft.Card(
@@ -808,6 +920,19 @@ def main(page: ft.Page):
             style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=30)),
             on_click=lambda e: start_playlist_download(playlist_entries)
         )
+        
+        # Calculate initial size
+        initial_mb = 0
+        total_sec = sum([float(e.get('duration', 0)) for e in entries])
+        # Default is Video High
+        initial_mb = estimate_size(total_sec, False, "high")
+
+        dl_row = ft.Row([
+            ft.Column([
+                btn_dl_all,
+                ft.Text(f"Estimado: ~{int(initial_mb)} MB", ref=size_est_ref, size=12, color=ft.Colors.GREY_600, text_align=ft.TextAlign.CENTER)
+            ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=2)
+        ], alignment=ft.MainAxisAlignment.CENTER)
 
         btn_cancel_playlist = ft.ElevatedButton(
             "CANCELAR",
@@ -829,7 +954,7 @@ def main(page: ft.Page):
              ft.Container(content=lv, height=350, border=ft.border.all(1, ft.Colors.GREY_200), border_radius=8, padding=5),
              path_display,
              playlist_progress_col,
-             ft.Row([btn_dl_all, btn_cancel_playlist], alignment=ft.MainAxisAlignment.CENTER, spacing=10)
+             ft.Row([dl_row, btn_cancel_playlist], alignment=ft.MainAxisAlignment.CENTER, spacing=10)
         ])
         page.update()
 
@@ -838,14 +963,41 @@ def main(page: ft.Page):
                   page.show_snack_bar(ft.SnackBar(ft.Text("Selecione uma pasta de destino!")))
                   return
 
-             btn_dl_all.visible = False
+             dl_row.visible = False
              btn_cancel_playlist.visible = True
              playlist_progress_col.visible = True
              
-             # Create progress bars
-             overall_progress = ft.ProgressBar(width=600, color=PRIMARY_COLOR, bgcolor=ft.Colors.GREY_200)
-             overall_text = ft.Text("Iniciando...", color=ft.Colors.GREY_700, weight=ft.FontWeight.BOLD, size=16)
-             playlist_progress_col.controls = [overall_text, overall_progress]
+             # Create progress bars (Modernized)
+             
+             # Sub-components for progress
+             prog_bar = ft.ProgressBar(width=None, value=0, color=PRIMARY_COLOR, bgcolor=ft.Colors.GREY_200, height=10, border_radius=5)
+             
+             txt_item_counter = ft.Text("Item 0/0", weight=ft.FontWeight.BOLD, color=ft.Colors.GREY_800, size=14)
+             txt_percent = ft.Text("0%", weight=ft.FontWeight.W_900, color=PRIMARY_COLOR, size=24)
+             txt_status_detail = ft.Text("Preparando...", color=ft.Colors.GREY_500, size=12, text_align=ft.TextAlign.CENTER)
+
+             progress_card = ft.Container(
+                 content=ft.Column([
+                     ft.Row([
+                         ft.Container(
+                             content=txt_item_counter,
+                             padding=ft.padding.symmetric(horizontal=10, vertical=5),
+                             bgcolor=ft.Colors.GREY_200,
+                             border_radius=20
+                         ),
+                         ft.Container(expand=True), # Spacer
+                         txt_percent
+                     ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                     prog_bar,
+                     ft.Container(content=txt_status_detail, alignment=ft.alignment.center)
+                 ], spacing=10),
+                 padding=20,
+                 bgcolor=ft.Colors.INDIGO_50,
+                 border_radius=12,
+                 border=ft.border.all(1, ft.Colors.INDIGO_100)
+             )
+
+             playlist_progress_col.controls = [progress_card]
              page.update()
              
              def dl_thread():
@@ -860,10 +1012,10 @@ def main(page: ft.Page):
                      item.ref_status.current.color = ft.Colors.BLUE
                      item.ref_status.current.update()
                      
-                     # Check format: "75% ------------ 2/6"
-                     # Initial text before progress starts
-                     overall_text.value = f"0% ------------ {i+1}/{total}"
-                     page.update()
+                     # Update Counter: Item 1/6
+                     txt_item_counter.value = f"Item {i+1}/{total}"
+                     txt_status_detail.value = f"Iniciando: {item.data.get('title', '...')}"
+                     progress_card.update()
 
                      # Download
                      vid_url = item.data.get('url')
@@ -873,14 +1025,29 @@ def main(page: ft.Page):
                      def item_hook(d):
                          if d.get('status') == 'downloading':
                              p = d.get('_percent_str', '').replace('%','')
+                             speed = d.get('_speed_str', '')
+                             eta = d.get('_eta_str', '')
                              if p:
                                  # Update individual
                                  item.ref_status.current.value = f"{p}%"
                                  item.ref_status.current.update()
-                                 # Update Global: "75% ------------ 2/6"
-                                 overall_text.value = f"{p}% ------------ {i+1}/{total}"
-                                 overall_text.update()
-
+                                 
+                                 # Update Global Logic
+                                 # We can either make the bar represent the SINGLE item progress or the TOTAL progress.
+                                 # User asked for "75% ... Item 2/6". This implies the percentage is for the CURRENT item.
+                                 # Let's stick to Current Item Percentage on the main text, but maybe mapped to bar?
+                                 # Or better: Bar = Total Progress?
+                                 # Actually, usually in playlists: Bar = Total Items Completed? 
+                                 # Let's make Bar = (Completed Items + Current%) / Total
+                                 
+                                 current_p_val = float(p) / 100
+                                 total_p = (completed + current_p_val) / total
+                                 
+                                 prog_bar.value = total_p
+                                 txt_percent.value = f"{p}%"
+                                 txt_status_detail.value = f"Baixando: {speed} - ETA: {eta}"
+                                 progress_card.update()
+                                 
                      success, msg = service.download(
                          vid_url, 
                          path_text.current.value, 
@@ -900,17 +1067,24 @@ def main(page: ft.Page):
                      
                      item.ref_status.current.update()
                      completed += 1
-                     overall_progress.value = completed / total
-                     page.update()
+                     
+                     # Force update bar to next integer step
+                     prog_bar.value = completed / total
+                     progress_card.update()
 
                  if service._cancel_flag:
-                      overall_text.value = "Download Cancelado"
-                      overall_text.color = ft.Colors.RED
+                      txt_status_detail.value = "Download Cancelado"
+                      txt_status_detail.color = ft.Colors.RED
+                      prog_bar.color = ft.Colors.RED
                  else:
-                      overall_text.value = "Playlist Finalizada!"
-                      overall_text.color = ft.Colors.GREEN
+                      txt_status_detail.value = "Playlist Finalizada com Sucesso!"
+                      txt_status_detail.color = ft.Colors.GREEN
+                      prog_bar.value = 1
+                      prog_bar.color = ft.Colors.GREEN
+                      txt_percent.value = "100%"
                  
-                 btn_dl_all.visible = True
+                 progress_card.update()
+                 dl_row.visible = True
                  btn_cancel_playlist.visible = False
                  page.update()
 
