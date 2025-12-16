@@ -9,6 +9,16 @@ import logging
 import traceback
 import asyncio
 
+# --- Auto-Setup FFmpeg (First Run) ---
+# This ensures FFmpeg is available before the app starts
+try:
+    import setup_ffmpeg
+    setup_ffmpeg.setup()
+except Exception as e:
+    print(f"Warning: FFmpeg auto-setup failed: {e}")
+    print("The application may not work correctly without FFmpeg.")
+
+
 # --- Logging Setup ---
 logging.basicConfig(
     filename='app_log.txt',
@@ -124,6 +134,7 @@ class YtDlpService:
             "--restrict-filenames",
             "--newline", # Important for progress parsing
             "--progress",
+            "--ffmpeg-location", os.path.dirname(os.path.abspath(__file__)), # Force local ffmpeg
             "-o", out_tmpl,
             url
         ]

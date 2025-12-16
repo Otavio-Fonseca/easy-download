@@ -17,16 +17,11 @@ def log(msg):
     print(f"[Auto-Setup] {msg}")
 
 def check_installed():
-    """Check if ffmpeg is available in current dir or PATH."""
+    """Check if ffmpeg is available in current dir."""
     if os.path.exists(FFMPEG_EXE) and os.path.exists(FFPROBE_EXE):
         return True
     
-    # Check PATH
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
+    return False
 
 def download_progress(count, block_size, total_size):
     percent = int(count * block_size * 100 / total_size)
