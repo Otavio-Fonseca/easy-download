@@ -8,6 +8,9 @@ import sys
 import logging
 import traceback
 import asyncio
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict
 
 # --- Auto-Setup FFmpeg (First Run) ---
 # This ensures FFmpeg is available before the app starts
@@ -51,19 +54,49 @@ class YtDlpService:
     def __init__(self):
         self._current_process = None
         self._cancel_flag = False
+        self._metadata_cache = {}  # Cache: {url: (timestamp, info_dict)}
+        self._cache_ttl = 300  # 5 minutes TTL
+        self._progress_throttle = {}  # Track last update time per download
+        self._progress_regex = re.compile(r'\[download\]\s+(\d+\.?\d*)%')  # Pre-compiled regex
+        self._active_downloads = []  # Track active parallel downloads
 
     def cancel(self):
         self._cancel_flag = True
+        # Cancel single process
         if self._current_process:
             try:
                 log("Attempting to kill process...")
                 self._current_process.terminate()
-                # Force kill if needed
-                # self._current_process.kill() 
                 log("Process termination signal sent.")
             except Exception as e:
                 log_error(f"Error killing process: {e}")
+        
+        # Cancel all parallel downloads
+        for proc in self._active_downloads:
+            try:
+                if proc and proc.poll() is None:  # Process still running
+                    proc.terminate()
+            except Exception as e:
+                log_error(f"Error killing parallel process: {e}")
 
+    def get_info_cached(self, url, use_cache=True):
+        """Fetches metadata with caching support."""
+        # Check cache first
+        if use_cache and url in self._metadata_cache:
+            timestamp, cached_info = self._metadata_cache[url]
+            if time.time() - timestamp < self._cache_ttl:
+                log(f"Using cached info for: {url}")
+                return cached_info
+        
+        # Fetch fresh data
+        info = self.get_info(url)
+        
+        # Store in cache
+        if info and use_cache:
+            self._metadata_cache[url] = (time.time(), info)
+        
+        return info
+    
     def get_info(self, url):
         """Fetches metadata using subprocess. Supports single videos and playlists."""
         log(f"Fetching info for: {url}")
@@ -213,9 +246,19 @@ class YtDlpService:
                     except:
                         pass
 
-                # Simple progress parsing
+                # Optimized progress parsing with throttling
                 # [download]  23.5% of ...
                 if line.startswith('[download]'):
+                    # Throttle updates: max 2 per second
+                    current_time = time.time()
+                    download_id = url  # Use URL as unique identifier
+                    last_update = self._progress_throttle.get(download_id, 0)
+                    
+                    if current_time - last_update < 0.5:  # 500ms throttle
+                        continue
+                    
+                    self._progress_throttle[download_id] = current_time
+                    
                     parts = line.split()
                     data = {'status': 'downloading'}
                     for i, part in enumerate(parts):
@@ -815,8 +858,7 @@ def main(page: ft.Page):
                 self.ref_format.current.value = valid_opts[0]
                 self.format_val = valid_opts[0]
 
-            self.ref_quality.current.update()
-            self.ref_format.current.update()
+            # REMOVED: individual .update() calls - batch update handled by parent
 
     def show_playlist_options(info):
         content_container.controls.clear()
@@ -853,19 +895,35 @@ def main(page: ft.Page):
              size_est_ref.current.value = f"Estimado: ~{int(mb)} MB"
              size_est_ref.current.update()
 
-        # Global Controls
+        # Global Controls with Debouncing (Threading-based for Flet compatibility)
+        debounce_timer = None
+        
         def on_global_change(e):
-             # 0=Video, 1=Audio
-             is_audio = (global_type_ref.current.selected_index == 1)
-             qual = global_qual_ref.current.value
-             # Map global quality to format defaults or keep simple
-             fmt = "mp3" if is_audio else "mp4"
-             
-             for entry in playlist_entries:
-                 entry.sync_global(is_audio, qual, fmt)
-             
-             update_size_est()
-             page.update()
+            """Debounced version - waits 300ms before applying changes"""
+            nonlocal debounce_timer
+            
+            # Cancel previous timer if exists
+            if debounce_timer:
+                debounce_timer.cancel()
+            
+            # Create new timer
+            def apply_changes():
+                # 0=Video, 1=Audio
+                is_audio = (global_type_ref.current.selected_index == 1)
+                qual = global_qual_ref.current.value
+                # Map global quality to format defaults or keep simple
+                fmt = "mp3" if is_audio else "mp4"
+                
+                # Batch update all entries (no individual .update() calls)
+                for entry in playlist_entries:
+                    entry.sync_global(is_audio, qual, fmt)
+                
+                update_size_est()
+                page.update()  # Single update for all changes
+            
+            # Schedule update after 300ms
+            debounce_timer = threading.Timer(0.3, apply_changes)
+            debounce_timer.start()
 
         global_controls = ft.Card(
             content=ft.Container(
@@ -937,6 +995,27 @@ def main(page: ft.Page):
         total_sec = sum([float(e.get('duration', 0)) for e in entries])
         # Default is Video High
         initial_mb = estimate_size(total_sec, False, "high")
+        
+        # Parallel download configuration
+        parallel_workers_ref = ft.Ref[ft.Dropdown]()
+        parallel_config = ft.Row([
+            ft.Icon(ft.Icons.SPEED, color=PRIMARY_COLOR, size=20),
+            ft.Dropdown(
+                ref=parallel_workers_ref,
+                label="Downloads Simultâneos",
+                options=[
+                    ft.dropdown.Option("1", "1 (Sequencial)"),
+                    ft.dropdown.Option("2", "2 (Rápido)"),
+                    ft.dropdown.Option("3", "3 (Muito Rápido)"),
+                    ft.dropdown.Option("5", "5 (Máximo)"),
+                ],
+                value="3",
+                width=200,
+                content_padding=10,
+                text_size=12,
+                tooltip="Número de downloads paralelos. Mais = mais rápido, mas usa mais recursos."
+            )
+        ], spacing=10, alignment=ft.MainAxisAlignment.CENTER)
 
         dl_row = ft.Row([
             ft.Column([
@@ -956,6 +1035,18 @@ def main(page: ft.Page):
             on_click=lambda _: service.cancel()
         )
         
+        btn_open_folder_playlist = ft.ElevatedButton(
+            "ABRIR PASTA",
+            icon=ft.Icons.FOLDER_ROUNDED,
+            bgcolor=ft.Colors.GREEN_600,
+            color=ft.Colors.WHITE,
+            height=55,
+            width=220,
+            visible=False,
+            style=ft.ButtonStyle(shape=ft.RoundedRectangleBorder(radius=30)),
+            on_click=lambda _: os.startfile(path_text.current.value)
+        )
+        
         # Progress area for playlist
         playlist_progress_col = ft.Column(visible=False, spacing=10)
 
@@ -964,8 +1055,9 @@ def main(page: ft.Page):
              global_controls,
              ft.Container(content=lv, height=350, border=ft.border.all(1, ft.Colors.GREY_200), border_radius=8, padding=5),
              path_display,
+             parallel_config,  # NEW: Parallel download configuration
              playlist_progress_col,
-             ft.Row([dl_row, btn_cancel_playlist], alignment=ft.MainAxisAlignment.CENTER, spacing=10)
+             ft.Row([dl_row, btn_cancel_playlist, btn_open_folder_playlist], alignment=ft.MainAxisAlignment.CENTER, spacing=10)
         ])
         page.update()
 
@@ -1012,21 +1104,40 @@ def main(page: ft.Page):
              page.update()
              
              def dl_thread():
+                 # Get parallel workers configuration
+                 max_workers = int(parallel_workers_ref.current.value)
                  total = len(entries_list)
                  completed = 0
+                 completed_lock = threading.Lock()  # Thread-safe counter
                  
-                 for i, item in enumerate(entries_list):
-                     if service._cancel_flag: break
+                 # Track aggregate speed
+                 active_speeds = {}  # {item_index: speed_str}
+                 speed_lock = threading.Lock()
+                 
+                 def download_single_item(item_data):
+                     """Download a single item - runs in thread pool"""
+                     item, i = item_data
+                     nonlocal completed
+                     
+                     if service._cancel_flag:
+                         return False, "Cancelled"
                      
                      # UI Update for Item Start
                      item.ref_status.current.value = "Baixando..."
                      item.ref_status.current.color = ft.Colors.BLUE
-                     item.ref_status.current.update()
+                     try:
+                         item.ref_status.current.update()
+                     except:
+                         pass  # Ignore update errors in parallel context
                      
-                     # Update Counter: Item 1/6
-                     txt_item_counter.value = f"Item {i+1}/{total}"
-                     txt_status_detail.value = f"Iniciando: {item.data.get('title', '...')}"
-                     progress_card.update()
+                     # Update Counter: Item X/Y
+                     with completed_lock:
+                         txt_item_counter.value = f"Item {i+1}/{total}"
+                         txt_status_detail.value = f"Baixando: {item.data.get('title', '...')[:40]}..."
+                         try:
+                             progress_card.update()
+                         except:
+                             pass
 
                      # Download
                      vid_url = item.data.get('url')
@@ -1038,27 +1149,38 @@ def main(page: ft.Page):
                              p = d.get('_percent_str', '').replace('%','')
                              speed = d.get('_speed_str', '')
                              eta = d.get('_eta_str', '')
+                             
                              if p:
-                                 # Update individual
+                                 # Update individual item
                                  item.ref_status.current.value = f"{p}%"
-                                 item.ref_status.current.update()
+                                 try:
+                                     item.ref_status.current.update()
+                                 except:
+                                     pass
                                  
-                                 # Update Global Logic
-                                 # We can either make the bar represent the SINGLE item progress or the TOTAL progress.
-                                 # User asked for "75% ... Item 2/6". This implies the percentage is for the CURRENT item.
-                                 # Let's stick to Current Item Percentage on the main text, but maybe mapped to bar?
-                                 # Or better: Bar = Total Progress?
-                                 # Actually, usually in playlists: Bar = Total Items Completed? 
-                                 # Let's make Bar = (Completed Items + Current%) / Total
-                                 
-                                 current_p_val = float(p) / 100
-                                 total_p = (completed + current_p_val) / total
-                                 
-                                 prog_bar.value = total_p
-                                 txt_percent.value = f"{p}%"
-                                 txt_status_detail.value = f"Baixando: {speed} - ETA: {eta}"
-                                 progress_card.update()
-                                 
+                                 # Update aggregate speed
+                                 with speed_lock:
+                                     if speed:
+                                         active_speeds[i] = speed
+                                     
+                                     # Calculate total progress
+                                     with completed_lock:
+                                         current_p_val = float(p) / 100 if p else 0
+                                         total_p = (completed + current_p_val) / total
+                                         
+                                         prog_bar.value = total_p
+                                         txt_percent.value = f"{int(total_p * 100)}%"
+                                         
+                                         # Show aggregate speed
+                                         if active_speeds:
+                                             speeds_str = " + ".join(active_speeds.values())
+                                             txt_status_detail.value = f"Velocidade: {speeds_str}"
+                                         
+                                         try:
+                                             progress_card.update()
+                                         except:
+                                             pass
+                     
                      success, msg = service.download(
                          vid_url, 
                          path_text.current.value, 
@@ -1068,6 +1190,10 @@ def main(page: ft.Page):
                          item_hook
                      )
                      
+                     # Remove from active speeds
+                     with speed_lock:
+                         active_speeds.pop(i, None)
+                     
                      if success:
                          item.ref_status.current.value = "Concluído"
                          item.ref_status.current.color = ft.Colors.GREEN
@@ -1076,13 +1202,47 @@ def main(page: ft.Page):
                          item.ref_status.current.color = ft.Colors.RED
                          log_error(f"Failed item {i}: {msg}")
                      
-                     item.ref_status.current.update()
-                     completed += 1
+                     try:
+                         item.ref_status.current.update()
+                     except:
+                         pass
                      
-                     # Force update bar to next integer step
-                     prog_bar.value = completed / total
-                     progress_card.update()
-
+                     with completed_lock:
+                         completed += 1
+                         # Force update bar to next integer step
+                         prog_bar.value = completed / total
+                         try:
+                             progress_card.update()
+                         except:
+                             pass
+                     
+                     return success, msg
+                 
+                 # Execute downloads in parallel
+                 try:
+                     with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                         # Submit all tasks
+                         futures = {
+                             executor.submit(download_single_item, (item, i)): i 
+                             for i, item in enumerate(entries_list)
+                         }
+                         
+                         # Wait for completion
+                         for future in as_completed(futures):
+                             if service._cancel_flag:
+                                 # Cancel remaining tasks
+                                 executor.shutdown(wait=False, cancel_futures=True)
+                                 break
+                             
+                             try:
+                                 success, msg = future.result()
+                             except Exception as e:
+                                 log_error(f"Download thread exception: {e}")
+                 
+                 except Exception as e:
+                     log_error(f"ThreadPoolExecutor error: {e}")
+                 
+                 # Final UI update
                  if service._cancel_flag:
                       txt_status_detail.value = "Download Cancelado"
                       txt_status_detail.color = ft.Colors.RED
@@ -1093,6 +1253,7 @@ def main(page: ft.Page):
                       prog_bar.value = 1
                       prog_bar.color = ft.Colors.GREEN
                       txt_percent.value = "100%"
+                      btn_open_folder_playlist.visible = True  # Show open folder button
                  
                  progress_card.update()
                  dl_row.visible = True
